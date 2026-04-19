@@ -838,6 +838,28 @@ class SATSEngine:
                 self._trade_dir    = 0
                 self._trade_closed = True
 
+    # ── 公開：重置交易狀態（預熱後呼叫）────────────
+    def reset_trade_state(self):
+        """
+        清除持倉、TP/SL 命中記錄與歷史交易事件。
+        技術指標緩衝區保持不變，確保預熱期間的虛擬觸發不計入正式統計。
+        """
+        self._trade_dir       = 0
+        self._trade_entry_bar = 0
+        self._trade_entry     = float("nan")
+        self._trade_sl        = float("nan")
+        self._trade_tp1       = float("nan")
+        self._trade_tp2       = float("nan")
+        self._trade_tp3       = float("nan")
+        self._trade_tp1r      = float("nan")
+        self._trade_tp2r      = float("nan")
+        self._trade_tp3r      = float("nan")
+        self._hit_tp1         = False
+        self._hit_tp2         = False
+        self._hit_tp3         = False
+        self._trade_closed    = False
+        self._trade_events    = []
+
     # ── 公開：取得本根 K 棒產生的交易事件 ────────
     @property
     def trade_events(self) -> list:

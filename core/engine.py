@@ -616,6 +616,8 @@ class SATSEngine:
                 bar_index = bi,
             )
 
+        self.last_close = close   # 即時價格，供外部（報告、UI）讀取
+
         if is_closed:
             self._bar_index += 1
         return signal

@@ -194,7 +194,9 @@ class SATSDatabase:
                 datetime.now(timezone.utc).isoformat(),
                 1 if sent else 0,
             ))
-            return cursor.lastrowid
+            last_id = cursor.lastrowid
+            conn.commit()
+            return last_id
 
     # ── TP/SL 事件記錄 ───────────────────────────────
     def record_tp_sl_event(
@@ -222,6 +224,7 @@ class SATSDatabase:
                 hit_r,
                 datetime.now(timezone.utc).isoformat(),
             ))
+            conn.commit()
 
     def get_tp_sl_event(self, signal_id: int, event_type: str) -> Optional[Dict[str, Any]]:
         """查詢是否已存在指定的 TP/SL 事件記錄"""
@@ -272,6 +275,7 @@ class SATSDatabase:
                 datetime.now(timezone.utc).isoformat(),
                 bars_held,
             ))
+            conn.commit()
 
     # ── 統計更新 ─────────────────────────────────────
     def update_symbol_stats(
@@ -362,6 +366,7 @@ class SATSDatabase:
                 """
                 params.append(symbol)
                 cursor.execute(query, params)
+                conn.commit()
 
     # ── 查詢統計 ─────────────────────────────────────
     def get_symbol_stats(self, symbol: str) -> Optional[Dict[str, Any]]:

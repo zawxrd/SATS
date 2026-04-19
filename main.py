@@ -537,6 +537,11 @@ class SATSBot:
             sym: SymbolStats() for sym in self.symbols
         }
 
+        # 追蹤每個幣種當前的 signal_id
+        self.current_signal_ids: Dict[str, int] = {
+            sym: 0 for sym in self.symbols
+        }
+
         # Discord 通知器
         dc = cfg["discord"]
         self.notifier = DiscordNotifier(
@@ -793,6 +798,7 @@ class SATSBot:
             "bar_index": sig.bar_index,
         }
         signal_id = self.db.record_signal(signal_data, sent=True)
+        self.current_signal_ids[symbol] = signal_id
 
         # ── 更新資料庫統計 ──────────────────────────────
         self.db.update_symbol_stats(
@@ -852,7 +858,10 @@ class SATSBot:
 
             if evt_type in ("tp1_hit", "tp2_hit"):
                 # 記錄 TP 命中事件
-                signal_id = self._get_latest_signal_id(symbol)
+                signal_id = self.current_signal_ids.get(symbol, 0)
+                if not signal_id:
+                    signal_id = self._get_latest_signal_id(symbol)
+                
                 if signal_id:
                     # 1. 檢查是否已記錄過，防止重複處理
                     existing = self.db.get_tp_sl_event(signal_id, evt_type)
@@ -904,7 +913,9 @@ class SATSBot:
                 )
 
                 # 取得 signal_id 用於記錄
-                signal_id = self._get_latest_signal_id(symbol)
+                signal_id = self.current_signal_ids.get(symbol, 0)
+                if not signal_id:
+                    signal_id = self._get_latest_signal_id(symbol)
                 
                 # 記錄平倉交易到資料庫
                 if signal_id:

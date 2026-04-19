@@ -708,6 +708,13 @@ class SATSBot:
         if failed_syms:
             self.ws_manager.symbols = self.symbols
 
+        # ── 預熱後重置所有引擎的交易狀態 ──────────────
+        # 技術指標緩衝區保持不變，僅清除持倉、TP/SL 命中記錄與歷史事件，
+        # 確保預熱期間虛擬觸發的開關單不計入正式統計。
+        for sym, engine in self.engines.items():
+            engine.reset_trade_state()
+            logger.debug(f"[{sym}] 預熱交易狀態已重置")
+
         return results
 
     # ── WebSocket 回調 ────────────────────────────

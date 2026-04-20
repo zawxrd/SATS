@@ -120,25 +120,39 @@ class SATSDiscordBot(commands.Bot):
     # ══════════════════════════════════════════════
     def _register_commands(self):
 
+        async def _safe_reply(interaction: discord.Interaction, build_fn, *args, **kwargs):
+            """defer → build embed → followup，任何例外都確保使用者收到回應。"""
+            try:
+                await interaction.response.defer()
+            except discord.NotFound:
+                logger.warning("[DiscordBot] Interaction 已過期，無法 defer")
+                return
+            except Exception as e:
+                logger.error(f"[DiscordBot] defer 失敗：{e}")
+                return
+            try:
+                embed_dict = build_fn(*args, **kwargs)
+                await interaction.followup.send(embed=discord.Embed.from_dict(embed_dict))
+            except Exception as e:
+                logger.error(f"[DiscordBot] 指令執行失敗：{e}", exc_info=True)
+                try:
+                    await interaction.followup.send(f"❌ 發生錯誤：`{e}`", ephemeral=True)
+                except Exception:
+                    pass
+
         # ── /status ───────────────────────────────
         @self.tree.command(name="status", description="顯示 SATS Bot 整體運行狀態")
         async def cmd_status(interaction: discord.Interaction):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
-            embed = self._build_status_embed()
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_status_embed)
 
         # ── /positions ────────────────────────────
         @self.tree.command(name="positions", description="顯示目前所有開倉")
         async def cmd_positions(interaction: discord.Interaction):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
-            embed = self._build_positions_embed()
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_positions_embed)
 
         # ── /stats ────────────────────────────────
         @self.tree.command(name="stats", description="查詢幣種績效統計")
@@ -146,11 +160,8 @@ class SATSDiscordBot(commands.Bot):
         async def cmd_stats(interaction: discord.Interaction, symbol: str = ""):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
             sym = symbol.upper().strip() if symbol else None
-            embed = self._build_stats_embed(sym)
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_stats_embed, sym)
 
         # ── /tqi ──────────────────────────────────
         @self.tree.command(name="tqi", description="TQI 品質指數排行榜")
@@ -158,11 +169,7 @@ class SATSDiscordBot(commands.Bot):
         async def cmd_tqi(interaction: discord.Interaction, top: int = 10):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
-            top = max(1, min(top, 25))
-            embed = self._build_tqi_embed(top)
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_tqi_embed, max(1, min(top, 25)))
 
         # ── /signal ───────────────────────────────
         @self.tree.command(name="signal", description="查詢某幣種最近一筆訊號資訊")
@@ -170,10 +177,7 @@ class SATSDiscordBot(commands.Bot):
         async def cmd_signal(interaction: discord.Interaction, symbol: str):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
-            embed = self._build_signal_embed(symbol.upper().strip())
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_signal_embed, symbol.upper().strip())
 
         # ── /report ───────────────────────────────
         @self.tree.command(name="report", description="立即觸發一次績效報告")
@@ -182,16 +186,14 @@ class SATSDiscordBot(commands.Bot):
                 return await self._deny(interaction, "請在指定頻道使用指令")
             if not self._is_admin(interaction):
                 return await self._deny(interaction, "需要管理員身份組")
-
-            await interaction.response.send_message(
-                embed=discord.Embed(description="📊 正在產生報告，請稍候...", color=COLOR_INFO),
-                ephemeral=True,
-            )
-            # 在背景執行，避免阻塞 event loop
-            threading.Thread(
-                target=self.sats_bot._reporter._send_report,
-                daemon=True,
-            ).start()
+            try:
+                await interaction.response.send_message(
+                    embed=discord.Embed(description="📊 正在產生報告，請稍候...", color=COLOR_INFO),
+                    ephemeral=True,
+                )
+                threading.Thread(target=self.sats_bot._reporter._send_report, daemon=True).start()
+            except Exception as e:
+                logger.error(f"[DiscordBot] /report 失敗：{e}", exc_info=True)
 
         # ── /pause ────────────────────────────────
         @self.tree.command(name="pause", description="暫停發送 Discord 通知（引擎繼續運行）")
@@ -200,15 +202,17 @@ class SATSDiscordBot(commands.Bot):
                 return await self._deny(interaction, "請在指定頻道使用指令")
             if not self._is_admin(interaction):
                 return await self._deny(interaction, "需要管理員身份組")
-
-            self._paused = True
-            self.sats_bot._notifications_paused = True
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="⏸️ 通知已暫停。引擎繼續運行，但不會發送任何 Discord 訊息。\n使用 `/resume` 恢復。",
-                    color=COLOR_WARN,
-                ),
-            )
+            try:
+                self._paused = True
+                self.sats_bot._notifications_paused = True
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        description="⏸️ 通知已暫停。引擎繼續運行，但不會發送任何 Discord 訊息。\n使用 `/resume` 恢復。",
+                        color=COLOR_WARN,
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"[DiscordBot] /pause 失敗：{e}", exc_info=True)
 
         # ── /resume ───────────────────────────────
         @self.tree.command(name="resume", description="恢復發送 Discord 通知")
@@ -217,25 +221,21 @@ class SATSDiscordBot(commands.Bot):
                 return await self._deny(interaction, "請在指定頻道使用指令")
             if not self._is_admin(interaction):
                 return await self._deny(interaction, "需要管理員身份組")
-
-            self._paused = False
-            self.sats_bot._notifications_paused = False
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="▶️ 通知已恢復。",
-                    color=COLOR_BUY,
-                ),
-            )
+            try:
+                self._paused = False
+                self.sats_bot._notifications_paused = False
+                await interaction.response.send_message(
+                    embed=discord.Embed(description="▶️ 通知已恢復。", color=COLOR_BUY),
+                )
+            except Exception as e:
+                logger.error(f"[DiscordBot] /resume 失敗：{e}", exc_info=True)
 
         # ── /watchlist ────────────────────────────
         @self.tree.command(name="watchlist", description="顯示目前監控的幣種清單")
         async def cmd_watchlist(interaction: discord.Interaction):
             if not self._check_channel(interaction):
                 return await self._deny(interaction, "請在指定頻道使用指令")
-
-            await interaction.response.defer()
-            embed = self._build_watchlist_embed()
-            await interaction.followup.send(embed=discord.Embed.from_dict(embed))
+            await _safe_reply(interaction, self._build_watchlist_embed)
 
     # ══════════════════════════════════════════════
     # Embed 建構

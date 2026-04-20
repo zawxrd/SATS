@@ -9,14 +9,22 @@
 ```
 sats_bot/
 ├── main.py                  ← 主程式入口
+├── view_history.py          ← 歷史訊號查詢工具
+├── diagnose_db.py           ← 資料庫診斷工具
+├── sats_bot.db              ← SQLite 資料庫（自動建立）
 ├── requirements.txt
 ├── config/
 │   └── config.yaml          ← 所有設定在這裡
 ├── core/
 │   ├── engine.py            ← SATS 核心引擎（完整移植）
-│   └── binance_ws.py        ← Binance WebSocket + REST 預熱
+│   ├── database.py          ← SQLite 資料庫操作
+│   ├── binance_ws.py        ← Binance WebSocket + REST 預熱
+│   ├── bingx_ws.py          ← BingX WebSocket 支援
+│   └── __init__.py
 └── notifier/
-    └── discord.py           ← Discord Webhook 通知
+    ├── discord.py           ← Discord Webhook 通知
+    ├── discord_bot.py       ← Discord Bot 整合
+    └── __init__.py
 ```
 
 ---
@@ -29,16 +37,33 @@ sats_bot/
 pip install -r requirements.txt
 ```
 
-### 2. 設定 Discord Webhook
+### 2. 設定配置檔
 
-1. Discord 頻道右鍵 → **編輯頻道** → **整合** → **Webhook**
-2. 建立新 Webhook，複製 URL
-3. 貼到 `config/config.yaml`：
+編輯 `config/config.yaml`：
 
+#### 2.1 選擇交易所
+
+```yaml
+exchange: "binance"   # binance 或 bingx
+```
+
+#### 2.2 設定 Discord 通知
+
+**方式一：Webhook（簡單）**
 ```yaml
 discord:
   webhook_url: "https://discord.com/api/webhooks/XXXXXXXXXX/XXXXXX"
 ```
+
+**方式二：Discord Bot（進階，支援指令互動）**
+```yaml
+discord:
+  bot_token: "YOUR_BOT_TOKEN"
+  channel_id: "123456789012345678"
+  mention_role_id: "123456789012345678"   # 可選，訊號會 @該角色
+```
+
+> 💡 **取得 Webhook URL**：Discord 頻道右鍵 → **編輯頻道** → **整合** → **Webhook** → 建立新 Webhook → 複製 URL
 
 ### 3. 選擇交易對與週期
 
@@ -46,14 +71,23 @@ discord:
 symbols:
   - BTCUSDT
   - ETHUSDT
+  - SOLUSDT
 
 interval: "1h"   # 1m 5m 15m 30m 1h 4h 1d
 ```
 
-### 4. 執行
+### 4. 初始化資料庫（首次執行）
 
 ```bash
-# 一般執行
+# 自動建立資料庫與資料表（執行 main.py 時會自動完成）
+# 或手動診斷資料庫狀態
+python diagnose_db.py
+```
+
+### 5. 執行
+
+```bash
+# 一般執行（讀取 config/config.yaml）
 python main.py
 
 # 指定設定檔
@@ -64,6 +98,22 @@ python main.py --symbol BTCUSDT --symbol SOLUSDT --interval 4h
 
 # 開啟 DEBUG 日誌
 python main.py --debug
+
+# 指定交易所
+python main.py --exchange bingx
+```
+
+### 6. 查詢歷史訊號（選用）
+
+```bash
+# 查看所有歷史訊號
+python view_history.py
+
+# 查詢特定交易對
+python view_history.py --symbol BTCUSDT
+
+# 查詢最近 N 筆
+python view_history.py --limit 10
 ```
 
 ---

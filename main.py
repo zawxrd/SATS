@@ -877,111 +877,163 @@ class SATSBot:
             logger.error(f"[{symbol}] 通知發送過程發生錯誤: {e}", exc_info=True)
 
     # ── 交易事件處理（TP 命中 / 關倉）────────────────
+    #
+    # 倉位分批結算比例：
+    #   tp1_hit  → 50% 倉位
+    #   tp2_hit  → 25% 倉位
+    #   tp3_hit  → 25% 倉位
+    #   sl_hit / timeout → 剩餘未結算倉位
+    #
+    # 每次 TP/SL/timeout 命中都各自寫一筆 trade_close，
+    # pnl_percent 為該筆實際價格計算的百分比，
+    # 再乘上倉位比例後累加至 realized_pnl。
+    # ─────────────────────────────────────────────────
+    _TP_WEIGHTS = {"tp1_hit": 0.50, "tp2_hit": 0.25, "tp3_hit": 0.25}
+
     def _handle_trade_events(self, symbol: str, engine: "SATSEngine", stat: "SymbolStats"):
         for evt in engine.trade_events:
             evt_type = evt["type"]
             logger.info(f"[{symbol}] 交易事件: {evt_type}")
 
-            if evt_type in ("tp1_hit", "tp2_hit"):
-                # 記錄 TP 命中事件
-                signal_id = self.current_signal_ids.get(symbol, 0)
-                if not signal_id:
-                    signal_id = self._get_latest_signal_id(symbol)
-                
+            signal_id = self.current_signal_ids.get(symbol, 0)
+            if not signal_id:
+                signal_id = self._get_latest_signal_id(symbol)
+
+            entry  = evt["entry"]
+            exit_p = evt["exit_price"]
+            direction = evt["direction"]
+
+            # 計算原始 pnl%（未加權）
+            if direction == "BUY":
+                raw_pnl = (exit_p - entry) / entry * 100
+            else:
+                raw_pnl = (entry - exit_p) / entry * 100
+
+            if evt_type in ("tp1_hit", "tp2_hit", "tp3_hit"):
+                # ── 防止重複處理 ──────────────────────
                 if signal_id:
-                    # 1. 檢查是否已記錄過，防止重複處理
                     existing = self.db.get_tp_sl_event(signal_id, evt_type)
                     if existing:
                         logger.info(f"[{symbol}] {evt_type} 已處理過，跳過")
                         continue
-                    
-                    hit_tp = None
-                    if evt_type == "tp1_hit":
-                        hit_tp = 1
-                    elif evt_type == "tp2_hit":
-                        hit_tp = 2
-                    
-                    # 2. 寫入資料庫鎖定狀態
+
+                weight   = self._TP_WEIGHTS[evt_type]
+                hit_tp   = {"tp1_hit": 1, "tp2_hit": 2, "tp3_hit": 3}[evt_type]
+                weighted_pnl = raw_pnl * weight
+
+                # 更新內存統計
+                # 勝率只在 TP1 命中時計算（一筆交易只記錄一次勝負）
+                stat.realized_pnl += weighted_pnl
+                if evt_type == "tp1_hit":
+                    stat.trade_count += 1
+                    if raw_pnl > 0.000001:
+                        stat.win_count += 1
+
+                pnl_sign = "+" if weighted_pnl >= 0 else ""
+                cum_sign = "+" if stat.realized_pnl >= 0 else ""
+                logger.info(
+                    f"[{symbol}] {evt_type}  倉位={weight*100:.0f}%  "
+                    f"pnl={pnl_sign}{weighted_pnl:.2f}%  累積={cum_sign}{stat.realized_pnl:.2f}%"
+                    + (f"  勝率={stat.win_rate:.0f}%" if evt_type == "tp1_hit" and stat.win_rate is not None else "")
+                )
+
+                if signal_id:
+                    # 記錄 TP/SL 事件
                     self.db.record_tp_sl_event(
                         signal_id=signal_id,
                         symbol=symbol,
                         event_type=evt_type,
-                        hit_price=evt["exit_price"],    # 修正：key 為 exit_price
+                        hit_price=exit_p,
                         hit_tp=hit_tp,
                         hit_r=evt.get("hit_r"),
                     )
-                    
-                    # 3. 發送通知
-                    ok = self.notifier.send_tp_hit(evt, symbol, self.interval)
-                    logger.info(f"[{symbol}] {evt_type} 通知 {'✅' if ok else '❌'}")
+                    # 寫入 trade_close（以加權後的 pnl 存入）
+                    self.db.record_trade_close(
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        entry_price=entry,
+                        exit_price=exit_p,
+                        direction=direction,
+                        pnl_percent=weighted_pnl,
+                        close_reason=evt_type,
+                        entry_timestamp=evt.get("entry_timestamp", ""),
+                        bars_held=evt.get("bars_open", 0),
+                    )
+                    # 更新資料庫統計（勝負只在 tp1_hit 時記錄）
+                    self.db.update_symbol_stats(
+                        symbol=symbol,
+                        interval=self.interval,
+                        signal_sent=False,
+                        is_win=(raw_pnl > 0.000001) if evt_type == "tp1_hit" else None,
+                        pnl=weighted_pnl,
+                    )
 
-            elif evt_type in ("tp3_hit", "sl_hit", "timeout"):
-                # 計算本次盈虧
-                entry  = evt["entry"]
-                exit_p = evt["exit_price"]
-                if evt["direction"] == "BUY":
-                    pnl = (exit_p - entry) / entry * 100
-                else:
-                    pnl = (entry - exit_p) / entry * 100
+                # 發送 TP 命中通知
+                ok = self.notifier.send_tp_hit(evt, symbol, self.interval)
+                logger.info(f"[{symbol}] {evt_type} 通知 {'✅' if ok else '❌'}")
 
-                # 修正：確保勝率計算反映的是「利潤是否大於 0」
-                stat.realized_pnl += pnl
-                stat.trade_count  += 1
-                if pnl > 0.000001:  # 避免浮點數微小誤差
-                    stat.win_count += 1
+            elif evt_type in ("sl_hit", "timeout"):
+                # 計算剩餘倉位比例（依已命中的 TP 扣除）
+                remaining_weight = 1.0
+                if evt.get("hit_tp1"):
+                    remaining_weight -= self._TP_WEIGHTS["tp1_hit"]
+                if evt.get("hit_tp2"):
+                    remaining_weight -= self._TP_WEIGHTS["tp2_hit"]
+                if evt.get("hit_tp3"):
+                    remaining_weight -= self._TP_WEIGHTS["tp3_hit"]
+                remaining_weight = max(remaining_weight, 0.0)
 
-                pnl_sign = "+" if pnl >= 0 else ""
+                weighted_pnl = raw_pnl * remaining_weight
+
+                # 更新內存統計
+                # 勝率只在「未命中 TP1」時才記（命中 TP1 那次已計過勝）
+                stat.realized_pnl += weighted_pnl
+                if not evt.get("hit_tp1"):
+                    stat.trade_count += 1
+                    if weighted_pnl > 0.000001:
+                        stat.win_count += 1
+
+                pnl_sign = "+" if weighted_pnl >= 0 else ""
                 cum_sign = "+" if stat.realized_pnl >= 0 else ""
                 logger.info(
-                    f"[{symbol}] 關倉 {evt_type}  盈虧={pnl_sign}{pnl:.2f}%  "
-                    f"累積={cum_sign}{stat.realized_pnl:.2f}%  "
-                    f"勝率={stat.win_rate:.0f}%" if stat.win_rate else ""
+                    f"[{symbol}] {evt_type}  剩餘倉位={remaining_weight*100:.0f}%  "
+                    f"pnl={pnl_sign}{weighted_pnl:.2f}%  累積={cum_sign}{stat.realized_pnl:.2f}%  "
+                    + (f"勝率={stat.win_rate:.0f}%" if stat.win_rate is not None else "")
                 )
 
-                # 取得 signal_id 用於記錄
-                signal_id = self.current_signal_ids.get(symbol, 0)
-                if not signal_id:
-                    signal_id = self._get_latest_signal_id(symbol)
-                
-                # 記錄平倉交易到資料庫
                 if signal_id:
-                    # 先記錄 TP/SL 事件
                     self.db.record_tp_sl_event(
                         signal_id=signal_id,
                         symbol=symbol,
                         event_type=evt_type,
                         hit_price=exit_p,
                         hit_tp=None,
-                        hit_r=None,
+                        hit_r=evt.get("hit_r"),
                     )
-                    
-                    # 記錄完整的平倉交易
                     self.db.record_trade_close(
                         signal_id=signal_id,
                         symbol=symbol,
                         entry_price=entry,
                         exit_price=exit_p,
-                        direction=evt["direction"],
-                        pnl_percent=pnl,
+                        direction=direction,
+                        pnl_percent=weighted_pnl,
                         close_reason=evt_type,
-                        entry_timestamp=evt.get("entry_timestamp", ""),  # 修正：key 為 entry_timestamp
-                        bars_held=evt.get("bars_open", 0),               # 修正：key 為 bars_open
+                        entry_timestamp=evt.get("entry_timestamp", ""),
+                        bars_held=evt.get("bars_open", 0),
                     )
-
-                # 更新資料庫統計
-                self.db.update_symbol_stats(
-                    symbol=symbol,
-                    interval=self.interval,
-                    signal_sent=False,  # 這是平倉事件，不是新訊號
-                    is_win=(pnl > 0.000001),
-                    pnl=pnl
-                )
+                    self.db.update_symbol_stats(
+                        symbol=symbol,
+                        interval=self.interval,
+                        signal_sent=False,
+                        is_win=(weighted_pnl > 0.000001) if not evt.get("hit_tp1") else None,
+                        pnl=weighted_pnl,
+                    )
 
                 ok = self.notifier.send_close(
                     evt, symbol, self.interval,
-                    realized_pnl = stat.realized_pnl,
-                    trade_count  = stat.trade_count,
-                    win_rate     = stat.win_rate,
+                    realized_pnl=stat.realized_pnl,
+                    trade_count=stat.trade_count,
+                    win_rate=stat.win_rate,
                 )
                 logger.info(f"[{symbol}] 關倉通知 {'✅' if ok else '❌'}")
 

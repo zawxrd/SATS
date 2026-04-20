@@ -35,6 +35,13 @@ from notifier.discord import (
     COLOR_INFO, COLOR_WARN,
     build_signal_embed, build_open_embed, build_tp_hit_embed, build_close_embed,
 )
+try:
+    from notifier.discord_bot import start_discord_bot, stop_discord_bot
+    _DISCORD_BOT_AVAILABLE = True
+except ImportError:
+    _DISCORD_BOT_AVAILABLE = False
+    def start_discord_bot(*a, **kw): return None
+    def stop_discord_bot(*a, **kw): pass
 
 # 交易所模組在 load_config 後動態選擇（見 _load_exchange_module）
 _fetch_historical_klines = None   # type: ignore
@@ -565,6 +572,8 @@ class SATSBot:
         self._shutdown           = False
         self._reporter: Optional[HourlyReporter] = None
         self._shutdown_reason    = "手動停止"
+        self._notifications_paused = False   # /pause /resume 控制
+        self._discord_bot          = None    # SATSDiscordBot 實例
 
     # ── 啟動 ──────────────────────────────────────
     def start(self):
@@ -628,6 +637,12 @@ class SATSBot:
         )
         self._reporter.start()
 
+        # ── 啟動 Discord 指令 Bot（config 可控制）────
+        if self.cfg.get("discord", {}).get("bot_enabled", False) and _DISCORD_BOT_AVAILABLE:
+            self._discord_bot = start_discord_bot(self, self.cfg)
+        elif self.cfg.get("discord", {}).get("bot_enabled", False):
+            logger.warning("[DiscordBot] bot_enabled=true 但找不到 discord_bot 模組，請確認 discord.py 已安裝")
+
         # ── 啟動 WebSocket ────────────────────────
         self.ws_manager.start()
 
@@ -649,6 +664,7 @@ class SATSBot:
         if self._reporter:
             self._reporter.stop()
         self.ws_manager.stop()
+        stop_discord_bot(self._discord_bot)
 
         # ── 關閉通知 ──────────────────────────────
         uptime = time.time() - self._start_time
@@ -708,9 +724,7 @@ class SATSBot:
         if failed_syms:
             self.ws_manager.symbols = self.symbols
 
-        # ── 預熱後重置所有引擎的交易狀態 ──────────────
-        # 技術指標緩衝區保持不變，僅清除持倉、TP/SL 命中記錄與歷史事件，
-        # 確保預熱期間虛擬觸發的開關單不計入正式統計。
+        # 預熱完成後重置所有引擎的交易狀態，避免預熱期間的虛擬訊號計入統計
         for sym, engine in self.engines.items():
             engine.reset_trade_state()
             logger.debug(f"[{sym}] 預熱交易狀態已重置")
@@ -755,6 +769,11 @@ class SATSBot:
 
         if sig is None:
             return   # 無翻轉訊號
+
+        # ── 通知暫停：引擎繼續運行，但不發 Discord 訊息 ──
+        if getattr(self, "_notifications_paused", False):
+            logger.debug(f"[{symbol}] 通知暫停中，略過 {sig.direction} 訊號")
+            return
 
         # ── 1. 分數過濾（優先）────────────────────────
         # 分數不足直接 skip，不論持倉狀態，也不發 DC 通知
@@ -887,7 +906,7 @@ class SATSBot:
                         signal_id=signal_id,
                         symbol=symbol,
                         event_type=evt_type,
-                        hit_price=evt["hit_price"],
+                        hit_price=evt["exit_price"],    # 修正：key 為 exit_price
                         hit_tp=hit_tp,
                         hit_r=evt.get("hit_r"),
                     )
@@ -945,8 +964,8 @@ class SATSBot:
                         direction=evt["direction"],
                         pnl_percent=pnl,
                         close_reason=evt_type,
-                        entry_timestamp=evt.get("entry_time", ""),
-                        bars_held=evt.get("bars_held", 0),
+                        entry_timestamp=evt.get("entry_timestamp", ""),  # 修正：key 為 entry_timestamp
+                        bars_held=evt.get("bars_open", 0),               # 修正：key 為 bars_open
                     )
 
                 # 更新資料庫統計

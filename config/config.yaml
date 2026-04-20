@@ -18,7 +18,7 @@ interval: "1m"   # 可選: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d
 # ── 自動選取交易對（依成交額排名）────────────────
 auto_symbols:
   enabled: true       # true = 自動抓前 top_n 名；false = 使用上方 symbols 清單
-  top_n: 50         # 取前幾名（建議 50~200）
+  top_n: 200         # 取前幾名（建議 50~200）
   quote: "USDT"       # 計價幣篩選（USDT / USDC / BTC）
 
 # ── Discord 通知 ──────────────────────────────────
@@ -29,6 +29,11 @@ discord:
   mention_role_id: ""      # 填入 Role ID 可 @mention，留空不 mention
   username: "SATS Bot 🤖"
   avatar_url: ""           # Bot 頭像 URL（可留空）
+  #指令開關
+  bot_enabled: false           # false = 只用 Webhook，不啟動指令 Bot
+  bot_token: "YOUR_TOKEN"
+  command_channel_id: 123456789
+  admin_role_id: 987654321
 
 # ── 主要參數 (對應 Pine Script Main Settings) ────
 main:
@@ -67,7 +72,7 @@ tqi:
 # ── 風險管理 ──────────────────────────────────────
 risk:
   sl_atr_mult: 1.5
-  tp_mode: "Fixed"         # Fixed / Dynamic
+  tp_mode: "Dynamic"         # Fixed / Dynamic
   tp1_r: 1.0
   tp2_r: 2.0
   tp3_r: 3.0

@@ -546,6 +546,77 @@ class SATSDatabase:
             cursor.execute("DELETE FROM system_logs")
             logger.warning("所有資料庫數據已清除")
 
+    # ── 細粒度重置 ───────────────────────────────
+    def reset_stats_only(self):
+        """只重置 symbol_stats（統計歸零），保留原始訊號與交易記錄。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE symbol_stats SET
+                    total_signals   = 0,
+                    buy_signals     = 0,
+                    sell_signals    = 0,
+                    skipped_signals = 0,
+                    total_trades    = 0,
+                    win_trades      = 0,
+                    realized_pnl    = 0.0,
+                    last_signal_time  = NULL,
+                    last_entry_price  = NULL,
+                    last_entry_dir    = NULL,
+                    updated_at        = ?
+            """, (datetime.now(timezone.utc).isoformat(),))
+            logger.warning("symbol_stats 已全部歸零（保留原始記錄）")
+
+    def reset_symbol(self, symbol: str):
+        """刪除指定幣種的所有記錄（signals / tp_sl_events / trade_closes / symbol_stats）。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # 先取得該幣種所有 signal_id
+            cursor.execute("SELECT id FROM signals WHERE symbol = ?", (symbol,))
+            sig_ids = [r[0] for r in cursor.fetchall()]
+            if sig_ids:
+                placeholders = ",".join("?" * len(sig_ids))
+                cursor.execute(f"DELETE FROM trade_closes  WHERE signal_id IN ({placeholders})", sig_ids)
+                cursor.execute(f"DELETE FROM tp_sl_events  WHERE signal_id IN ({placeholders})", sig_ids)
+            cursor.execute("DELETE FROM signals       WHERE symbol = ?", (symbol,))
+            cursor.execute("DELETE FROM symbol_stats  WHERE symbol = ?", (symbol,))
+            logger.warning(f"[{symbol}] 所有記錄已刪除（{len(sig_ids)} 筆訊號）")
+            return len(sig_ids)
+
+    def reset_trades_only(self):
+        """只刪除 trade_closes 與 tp_sl_events，保留 signals 與 symbol_stats。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM trade_closes")
+            cursor.execute("DELETE FROM tp_sl_events")
+            logger.warning("trade_closes 與 tp_sl_events 已清除（signals 保留）")
+
+    def reset_by_date(self, before_date: str):
+        """刪除指定日期之前的所有記錄（before_date 格式：YYYY-MM-DD）。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # trade_closes
+            cursor.execute("SELECT signal_id FROM trade_closes WHERE close_timestamp < ?", (before_date,))
+            sig_ids = list({r[0] for r in cursor.fetchall()})
+            cursor.execute("DELETE FROM trade_closes  WHERE close_timestamp < ?", (before_date,))
+            cursor.execute("DELETE FROM tp_sl_events  WHERE timestamp       < ?", (before_date,))
+            cursor.execute("DELETE FROM signals        WHERE timestamp       < ?", (before_date,))
+            cursor.execute("DELETE FROM system_logs    WHERE timestamp       < ?", (before_date,))
+            logger.warning(f"已刪除 {before_date} 之前的所有記錄")
+
+    def get_reset_preview(self) -> dict:
+        """回傳各表記錄數，供重置前預覽用。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            result = {}
+            for table in ["signals", "tp_sl_events", "trade_closes", "symbol_stats", "system_logs"]:
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    result[table] = cursor.fetchone()[0]
+                except Exception:
+                    result[table] = -1
+            return result
+
     def export_to_csv(self, output_dir: str = "exports"):
         """匯出數據到 CSV 文件"""
         import csv

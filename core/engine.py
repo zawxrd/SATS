@@ -596,6 +596,9 @@ class SATSEngine:
                 self._hit_tp1 = self._hit_tp2 = self._hit_tp3 = False
                 self._trade_closed = False
                 self._trade_events = []
+                from datetime import datetime, timezone as _tz
+                self._trade_entry_timestamp = datetime.now(_tz.utc).isoformat()
+                self._trade_initial_risk    = abs(entry - trade_sl)
 
             signal = SignalResult(
                 direction = "BUY" if is_buy else "SELL",
@@ -616,7 +619,7 @@ class SATSEngine:
                 bar_index = bi,
             )
 
-        self.last_close = close   # 即時價格，供外部（報告、UI）讀取
+        self.last_close = close   # 即時價格，供報告/指令讀取
 
         if is_closed:
             self._bar_index += 1
@@ -758,17 +761,28 @@ class SATSEngine:
         timeout   = bars_open >= self.cfg["risk"].get("trade_timeout", 100)
 
         direction = "BUY" if td == 1 else "SELL"
+
+        # 計算 R 倍數（固定使用開倉時的原始 risk，breakeven 移 SL 後不影響）
+        import math as _math
+        _initial_risk = getattr(self, "_trade_initial_risk", None) or abs(self._trade_entry - self._trade_sl)
+        _initial_risk = _initial_risk if _initial_risk > 0 else float("nan")
+        def _calc_r(exit_price):
+            if _math.isnan(_initial_risk): return float("nan")
+            raw = (exit_price - self._trade_entry) if td == 1 else (self._trade_entry - exit_price)
+            return round(raw / _initial_risk, 4)
+
         base = {
-            "direction" : direction,
-            "entry"     : self._trade_entry,
-            "sl"        : self._trade_sl,
-            "tp1"       : self._trade_tp1,
-            "tp2"       : self._trade_tp2,
-            "tp3"       : self._trade_tp3,
-            "tp1r"      : self._trade_tp1r,
-            "tp2r"      : self._trade_tp2r,
-            "tp3r"      : self._trade_tp3r,
-            "bars_open" : bars_open,
+            "direction"        : direction,
+            "entry"            : self._trade_entry,
+            "entry_timestamp"  : getattr(self, "_trade_entry_timestamp", ""),
+            "sl"               : self._trade_sl,
+            "tp1"              : self._trade_tp1,
+            "tp2"              : self._trade_tp2,
+            "tp3"              : self._trade_tp3,
+            "tp1r"             : self._trade_tp1r,
+            "tp2r"             : self._trade_tp2r,
+            "tp3r"             : self._trade_tp3r,
+            "bars_open"        : bars_open,
         }
 
         # TP 命中里程碑（只在首次命中時發事件）
@@ -781,10 +795,11 @@ class SATSEngine:
                 self._trade_sl = self._trade_entry
             # ──────────────────────────────────────
 
-            # 更新 base 中的狀態，確保後續 TP2 事件抓到正確的 sl
-            base["sl"] = self._trade_sl
+            base["sl"]      = self._trade_sl
+            base["hit_tp1"] = True  # 同步，讓後續 tp2 事件看到正確狀態
 
             evt = {**base, "type": "tp1_hit", "exit_price": self._trade_tp1,
+                   "hit_r": _calc_r(self._trade_tp1),
                    "hit_tp1": True, "hit_tp2": self._hit_tp2, "hit_tp3": self._hit_tp3,
                    "is_breakeven": is_be}
             self._trade_events.append(evt)
@@ -798,11 +813,11 @@ class SATSEngine:
                 self._trade_sl = self._trade_tp1
             # ──────────────────────────────────────
 
-            # 同步更新 base 狀態，確保後續關倉事件抓到最新的 SL
             base["hit_tp2"] = True
             base["sl"]      = self._trade_sl
 
             evt = {**base, "type": "tp2_hit", "exit_price": self._trade_tp2,
+                   "hit_r": _calc_r(self._trade_tp2),
                    "hit_tp1": self._hit_tp1, "hit_tp2": True, "hit_tp3": self._hit_tp3,
                    "is_breakeven": is_be}
             self._trade_events.append(evt)
@@ -812,7 +827,6 @@ class SATSEngine:
 
         # 關倉事件（TP3 / SL / Timeout，只取第一個發生的）
         if not getattr(self, "_trade_closed", False):
-            # 同步最新狀態到 base
             base["hit_tp1"] = self._hit_tp1
             base["hit_tp2"] = self._hit_tp2
             base["sl"]      = self._trade_sl
@@ -820,51 +834,57 @@ class SATSEngine:
             if tp3_reached:
                 self._hit_tp3 = True
                 evt = {**base, "type": "tp3_hit", "exit_price": self._trade_tp3,
+                       "hit_r": _calc_r(self._trade_tp3),
                        "hit_tp1": self._hit_tp1, "hit_tp2": self._hit_tp2, "hit_tp3": True}
                 self._trade_events.append(evt)
                 self._trade_dir    = 0
                 self._trade_closed = True
             elif sl_hit:
                 evt = {**base, "type": "sl_hit", "exit_price": self._trade_sl,
+                       "hit_r": _calc_r(self._trade_sl),
                        "hit_tp1": self._hit_tp1, "hit_tp2": self._hit_tp2, "hit_tp3": False}
                 self._trade_events.append(evt)
                 self._trade_dir    = 0
                 self._trade_closed = True
             elif timeout:
-                exit_price = high if td == 1 else low   # 以當根 K 棒最有利價近似
+                exit_price = high if td == 1 else low
                 evt = {**base, "type": "timeout", "exit_price": exit_price,
+                       "hit_r": _calc_r(exit_price),
                        "hit_tp1": self._hit_tp1, "hit_tp2": self._hit_tp2, "hit_tp3": self._hit_tp3}
                 self._trade_events.append(evt)
                 self._trade_dir    = 0
                 self._trade_closed = True
-
-    # ── 公開：重置交易狀態（預熱後呼叫）────────────
-    def reset_trade_state(self):
-        """
-        清除持倉、TP/SL 命中記錄與歷史交易事件。
-        技術指標緩衝區保持不變，確保預熱期間的虛擬觸發不計入正式統計。
-        """
-        self._trade_dir       = 0
-        self._trade_entry_bar = 0
-        self._trade_entry     = float("nan")
-        self._trade_sl        = float("nan")
-        self._trade_tp1       = float("nan")
-        self._trade_tp2       = float("nan")
-        self._trade_tp3       = float("nan")
-        self._trade_tp1r      = float("nan")
-        self._trade_tp2r      = float("nan")
-        self._trade_tp3r      = float("nan")
-        self._hit_tp1         = False
-        self._hit_tp2         = False
-        self._hit_tp3         = False
-        self._trade_closed    = False
-        self._trade_events    = []
 
     # ── 公開：取得本根 K 棒產生的交易事件 ────────
     @property
     def trade_events(self) -> list:
         """回傳本根 K 棒的交易事件（list[dict]），取完後應自行清空或忽略舊值。"""
         return self._trade_events
+
+    # ── 預熱後重置交易狀態 ────────────────────────
+    def reset_trade_state(self):
+        """
+        預熱完成後呼叫。清除持倉、TP/SL 狀態與事件佇列。
+        技術指標緩衝區（ATR/RSI/ER/SuperTrend 等）保持不變。
+        """
+        self._trade_dir             = 0
+        self._trade_entry_bar       = 0
+        self._trade_entry           = float("nan")
+        self._trade_sl              = float("nan")
+        self._trade_tp1             = float("nan")
+        self._trade_tp2             = float("nan")
+        self._trade_tp3             = float("nan")
+        self._trade_tp1r            = float("nan")
+        self._trade_tp2r            = float("nan")
+        self._trade_tp3r            = float("nan")
+        self._hit_tp1               = False
+        self._hit_tp2               = False
+        self._hit_tp3               = False
+        self._trade_closed          = False
+        self._trade_events          = []
+        self._trade_entry_timestamp = ""
+        self._trade_initial_risk    = 0.0
+        self._signal_r_buffer.clear()
 
     # ── 狀態查詢 ─────────────────────────────────
     @property

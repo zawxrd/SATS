@@ -321,7 +321,7 @@ def generate_performance_report(days=7):
     start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     
     try:
-        # 總體統計
+        # 總體統計（勝率只計 tp1_hit 命中 / sl_hit(未命中tp1) / timeout(未命中tp1)）
         summary_query = """
             SELECT 
                 COUNT(*) as total_trades,
@@ -333,6 +333,12 @@ def generate_performance_report(days=7):
                 MIN(pnl_percent) as max_loss
             FROM trade_closes
             WHERE close_timestamp >= ?
+              AND (
+                close_reason = 'tp1_hit'
+                OR (close_reason IN ('sl_hit','timeout') AND signal_id NOT IN (
+                    SELECT DISTINCT signal_id FROM tp_sl_events WHERE event_type = 'tp1_hit'
+                ))
+              )
         """
         summary_df = pd.read_sql_query(summary_query, conn, params=(start_date,))
         

@@ -253,6 +253,8 @@ class SATSDatabase:
         bars_held: int,
     ):
         """記錄一筆完整的交易平倉"""
+        # is_win 以 pnl_percent 正負判斷，供查詢用
+        # 注意：勝率統計以 symbol_stats.win_trades / total_trades 為準
         is_win = 1 if pnl_percent > 0 else 0
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -345,11 +347,11 @@ class SATSDatabase:
                     updates.append("realized_pnl = realized_pnl + ?")
                     params.append(pnl)
 
-                if is_win is not None and is_win:
-                    updates.append("win_trades = win_trades + 1")
-
-                if pnl is not None:  # 有 PnL 代表完成一筆交易
+                if is_win is not None:
+                    # is_win 不為 None 代表這筆需要計入勝負統計
                     updates.append("total_trades = total_trades + 1")
+                    if is_win:
+                        updates.append("win_trades = win_trades + 1")
 
                 if entry_price is not None:
                     updates.append("last_entry_price = ?")

@@ -5,11 +5,20 @@ SATS Bot 歷史數據查看工具
 """
 
 import sqlite3
-import pandas as pd
+import shutil
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sys
-import shutil
+
+import pandas as pd
+
+# 嘗試載入 SATSDatabase（若在專案根目錄外執行則 fallback 到直接 sqlite3）
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from core.database import SATSDatabase
+    _HAS_DB_CLASS = True
+except ImportError:
+    _HAS_DB_CLASS = False
 
 # 資料庫路徑
 DB_PATH = Path("sats_bot.db")
@@ -421,6 +430,194 @@ def export_to_csv(output_dir="exports"):
     except Exception as e:
         print(f"❌ 匯出錯誤：{e}")
 
+# ══════════════════════════════════════════════════
+# 重置功能
+# ══════════════════════════════════════════════════
+def _backup_db() -> str:
+    """建立備份，回傳備份路徑。"""
+    backup_path = f"{DB_PATH}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        shutil.copy2(DB_PATH, backup_path)
+        print(f"💾 已建立備份：{backup_path}")
+    except Exception as e:
+        print(f"⚠️  備份失敗：{e}")
+        backup_path = ""
+    return backup_path
+
+
+def _confirm(prompt: str) -> bool:
+    """要求使用者輸入 YES 確認。"""
+    ans = input(f"{prompt}\n⚠️  此操作無法還原（已自動備份）。輸入 YES 確認：").strip()
+    return ans == "YES"
+
+
+def reset_history():
+    """互動式重置選單。"""
+    if not DB_PATH.exists():
+        print(f"❌ 找不到資料庫 {DB_PATH}")
+        return
+
+    # 取得各表記錄數預覽
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    counts = {}
+    for t in ["signals", "tp_sl_events", "trade_closes", "symbol_stats", "system_logs"]:
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM {t}")
+            counts[t] = cursor.fetchone()[0]
+        except Exception:
+            counts[t] = 0
+    conn.close()
+
+    print("\n" + "="*60)
+    print("🗑️   歷史資料重置")
+    print("="*60)
+    print("目前資料量：")
+    print(f"  signals      : {counts.get('signals', 0):>8,} 筆")
+    print(f"  tp_sl_events : {counts.get('tp_sl_events', 0):>8,} 筆")
+    print(f"  trade_closes : {counts.get('trade_closes', 0):>8,} 筆")
+    print(f"  symbol_stats : {counts.get('symbol_stats', 0):>8,} 筆")
+    print(f"  system_logs  : {counts.get('system_logs', 0):>8,} 筆")
+    print("="*60)
+    print("請選擇重置範圍：")
+    print("  1. 全部清除（保留資料庫結構）")
+    print("  2. 只重置統計數據（symbol_stats 歸零，保留訊號與交易記錄）")
+    print("  3. 只清除交易記錄（trade_closes + tp_sl_events，保留 signals）")
+    print("  4. 清除指定幣種的所有記錄")
+    print("  5. 清除指定日期之前的記錄")
+    print("  0. 返回")
+    print("="*60)
+
+    choice = input("請選擇 (0-5): ").strip()
+
+    if choice == "0":
+        return
+
+    # 全部清除
+    if choice == "1":
+        if not _confirm("即將清除所有歷史資料（signals / tp_sl_events / trade_closes / symbol_stats / system_logs）。"):
+            print("已取消")
+            return
+        _backup_db()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        for t in ["trade_closes", "tp_sl_events", "signals", "symbol_stats", "system_logs"]:
+            cursor.execute(f"DELETE FROM {t}")
+        conn.commit()
+        conn.close()
+        print("✅ 全部資料已清除")
+
+    # 只重置統計
+    elif choice == "2":
+        if not _confirm("即將將 symbol_stats 所有欄位歸零（訊號與交易記錄保留）。"):
+            print("已取消")
+            return
+        _backup_db()
+        now_str = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE symbol_stats SET
+                total_signals=0, buy_signals=0, sell_signals=0, skipped_signals=0,
+                total_trades=0, win_trades=0, realized_pnl=0.0,
+                last_signal_time=NULL, last_entry_price=NULL, last_entry_dir=NULL,
+                updated_at=?
+        """, (now_str,))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        print(f"✅ symbol_stats 已歸零（{affected} 個幣種）")
+
+    # 只清除交易記錄
+    elif choice == "3":
+        if not _confirm("即將清除所有 trade_closes 與 tp_sl_events（signals 保留）。"):
+            print("已取消")
+            return
+        _backup_db()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM trade_closes")
+        tc = cursor.rowcount
+        cursor.execute("DELETE FROM tp_sl_events")
+        te = cursor.rowcount
+        conn.commit()
+        conn.close()
+        print(f"✅ 已清除 trade_closes ({tc} 筆) 與 tp_sl_events ({te} 筆)")
+
+    # 清除指定幣種
+    elif choice == "4":
+        symbol = input("輸入幣種符號（例如 BTCUSDT）：").strip().upper()
+        if not symbol:
+            print("已取消")
+            return
+        # 預覽
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM signals WHERE symbol=?", (symbol,))
+        sig_cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM trade_closes WHERE symbol=?", (symbol,))
+        tc_cnt = cursor.fetchone()[0]
+        conn.close()
+        if sig_cnt == 0 and tc_cnt == 0:
+            print(f"⚠️  找不到 {symbol} 的任何記錄")
+            return
+        print(f"找到 {symbol}：signals={sig_cnt} 筆，trade_closes={tc_cnt} 筆")
+        if not _confirm(f"即將刪除 {symbol} 的所有記錄。"):
+            print("已取消")
+            return
+        _backup_db()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM signals WHERE symbol=?", (symbol,))
+        sig_ids = [r[0] for r in cursor.fetchall()]
+        if sig_ids:
+            ph = ",".join("?"*len(sig_ids))
+            cursor.execute(f"DELETE FROM trade_closes WHERE signal_id IN ({ph})", sig_ids)
+            cursor.execute(f"DELETE FROM tp_sl_events WHERE signal_id IN ({ph})", sig_ids)
+        cursor.execute("DELETE FROM signals      WHERE symbol=?", (symbol,))
+        cursor.execute("DELETE FROM symbol_stats WHERE symbol=?", (symbol,))
+        conn.commit()
+        conn.close()
+        print(f"✅ {symbol} 的所有記錄已刪除（{len(sig_ids)} 筆訊號）")
+
+    # 清除指定日期前的記錄
+    elif choice == "5":
+        date_str = input("清除哪個日期之前的記錄（格式 YYYY-MM-DD，例如 2026-01-01）：").strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            print("❌ 日期格式錯誤")
+            return
+        # 預覽
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM signals WHERE timestamp < ?", (date_str,))
+        s_cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM trade_closes WHERE close_timestamp < ?", (date_str,))
+        tc_cnt = cursor.fetchone()[0]
+        conn.close()
+        print(f"將刪除：signals={s_cnt} 筆，trade_closes={tc_cnt} 筆（{date_str} 之前）")
+        if s_cnt == 0 and tc_cnt == 0:
+            print("⚠️  該日期前無任何記錄")
+            return
+        if not _confirm(f"即將刪除 {date_str} 之前的所有記錄。"):
+            print("已取消")
+            return
+        _backup_db()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM trade_closes WHERE close_timestamp < ?", (date_str,))
+        cursor.execute("DELETE FROM tp_sl_events WHERE timestamp       < ?", (date_str,))
+        cursor.execute("DELETE FROM signals       WHERE timestamp       < ?", (date_str,))
+        cursor.execute("DELETE FROM system_logs   WHERE timestamp       < ?", (date_str,))
+        conn.commit()
+        conn.close()
+        print(f"✅ {date_str} 之前的記錄已清除")
+
+    else:
+        print("❌ 無效選項")
+
+
 def show_menu():
     """顯示選單"""
     print("\n" + "="*80)
@@ -434,6 +631,7 @@ def show_menu():
     print("6. 匯出數據到 CSV")
     print("7. 自訂 SQL 查詢")
     print("8. 修復資料庫結構 (Fix DB Schema)")
+    print("9. 重置歷史資料 (Reset History)")
     print("0. 退出")
     print("="*80)
 
@@ -476,7 +674,7 @@ def main():
 
     while True:
         show_menu()
-        choice = input("請選擇功能 (0-8): ").strip()
+        choice = input("請選擇功能 (0-9): ").strip()
         
         if choice == '1':
             view_symbol_stats()
@@ -516,6 +714,8 @@ def main():
             custom_sql_query()
         elif choice == '8':
             fix_database_structure()
+        elif choice == '9':
+            reset_history()
         elif choice == '0':
             print("👋 再見！")
             break
